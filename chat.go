@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/jiyeol-lee/openai/internal"
 )
 
 // Message represents a single message in a chat conversation
@@ -158,4 +160,74 @@ func (c *Client) CreateChatCompletionStream(
 		closer:  resp.Body,
 		isFirst: true,
 	}, nil
+}
+
+// CreateChatCompletionStreamWithMarkdown sends a streaming chat completion request
+// and renders the output incrementally as markdown using the StreamMarkdown function
+func (c *Client) CreateChatCompletionStreamWithMarkdown(
+	ctx context.Context,
+	req ChatCompletionRequest,
+	w io.Writer,
+	opts markdown.StreamOptions,
+) error {
+	stream, err := c.CreateChatCompletionStream(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to create stream: %w", err)
+	}
+	defer stream.Close()
+
+	// Create a channel to pass chunks to the markdown renderer
+	chunks := make(chan markdown.Chunk)
+
+	// Context for controlling the reader goroutine
+	readerCtx, cancelReader := context.WithCancel(ctx)
+	defer cancelReader()
+
+	// Goroutine to read from stream and send to chunks channel
+	errChan := make(chan error, 1)
+	go func() {
+		defer close(chunks)
+		for {
+			select {
+			case <-readerCtx.Done():
+				errChan <- readerCtx.Err()
+				return
+			default:
+			}
+
+			chunk, err := stream.Recv()
+			if err == io.EOF {
+				errChan <- nil
+				return
+			}
+			if err != nil {
+				errChan <- fmt.Errorf("stream error: %w", err)
+				return
+			}
+
+			// Extract content from delta
+			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+				select {
+				case chunks <- markdown.Chunk{Text: chunk.Choices[0].Delta.Content}:
+				case <-readerCtx.Done():
+					errChan <- readerCtx.Err()
+					return
+				}
+			}
+		}
+	}()
+
+	// Render the markdown stream
+	if err := markdown.StreamMarkdown(ctx, chunks, w, opts); err != nil {
+		cancelReader()
+		// Wait for goroutine to finish and check for stream errors
+		if streamErr := <-errChan; streamErr != nil && err == context.Canceled {
+			// If markdown was cancelled, prefer the stream error if available
+			return streamErr
+		}
+		return err
+	}
+
+	// Wait for the reader goroutine to finish
+	return <-errChan
 }

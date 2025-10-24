@@ -6,6 +6,7 @@ A Go package for OpenAI API chat completions with support for both streaming and
 
 - Simple, clean API for OpenAI chat completions
 - Support for streaming responses
+- Terminal markdown rendering for streaming responses
 - Support for custom HTTP clients
 - Context-aware requests
 - Proper error handling
@@ -20,11 +21,21 @@ go get github.com/jiyeol-lee/openai
 
 ### Basic Non-Streaming Chat Completion
 
-Check out the basic example [code](./examples/basic/basic.go)
+Send a prompt and wait for the full assistant reply in one shot:
+
+See the complete example in [examples/basic/basic.go](./examples/basic/basic.go).
 
 ### Streaming Chat Completion
 
-Check out the streaming example [code](./examples/streaming/streaming.go)
+Receive tokens as soon as they are ready and render them manually:
+
+See the complete example in [examples/stream/stream.go](./examples/stream/stream.go).
+
+### Streaming Chat Completion with Markdown Output
+
+Render the stream directly to a terminal-friendly markdown viewer while it arrives:
+
+See the complete example in [examples/stream_markdown/stream_markdown.go](./examples/stream_markdown/stream_markdown.go).
 
 ### With Custom HTTP Client
 
@@ -77,6 +88,14 @@ Response from a non-streaming completion request. Contains choices with the assi
 
 Response chunk from a streaming completion request.
 
+#### `StreamOptions`
+
+Configures how markdown streaming output is rendered.
+
+- `Raw`: When true, writes chunks directly without styling
+- `WordWrap`: Wrap width for the renderer (defaults to 120 when zero)
+- `Cancel`: Optional callback invoked when the user presses Ctrl+C in the markdown viewer
+
 #### `StreamReader`
 
 Provides access to streaming responses.
@@ -125,6 +144,21 @@ Sends a streaming chat completion request.
 
 - `*StreamReader`: A stream reader for receiving chunks
 - `error`: Any error that occurred
+
+#### `CreateChatCompletionStreamWithMarkdown(ctx context.Context, req ChatCompletionRequest, w io.Writer, opts StreamOptions) error`
+
+Sends a streaming chat completion request and renders the incremental markdown output to the provided writer.
+
+**Parameters:**
+
+- `ctx`: Context for the request
+- `req`: The chat completion request configuration
+- `w`: Destination for the rendered markdown (for example, `os.Stdout`)
+- `opts`: Rendering options that control wrapping, raw output, and cancellation
+
+**Returns:**
+
+- `error`: Any error that occurred while streaming or rendering
 
 #### `StreamReader.Recv() (ChatCompletionStreamResponse, error)`
 
