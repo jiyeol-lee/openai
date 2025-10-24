@@ -118,14 +118,16 @@ func waitForChunk(ctx context.Context, chunks <-chan Chunk) tea.Cmd {
 }
 
 type markdownModel struct {
-	renderer    *glamour.TermRenderer
-	viewport    viewport.Model
-	content     strings.Builder
-	rendered    string
-	nextChunk   func() tea.Cmd
-	cancel      func()
-	onInterrupt func()
-	err         error
+	renderer     *glamour.TermRenderer
+	viewport     viewport.Model
+	content      strings.Builder
+	rendered     string
+	windowWidth  int
+	windowHeight int
+	nextChunk    func() tea.Cmd
+	cancel       func()
+	onInterrupt  func()
+	err          error
 }
 
 func newMarkdownModel(
@@ -174,8 +176,10 @@ func (m *markdownModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 	case tea.WindowSizeMsg:
+		m.windowWidth = msg.Width
+		m.windowHeight = msg.Height
 		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height
+		m.resizeViewport()
 		m.viewport.SetContent(m.rendered)
 		return m, nil
 	}
@@ -210,8 +214,35 @@ func (m *markdownModel) appendChunk(text string) error {
 
 	rendered = strings.TrimRightFunc(rendered, unicode.IsSpace) + "\n"
 	m.rendered = rendered
+	m.resizeViewport()
 	m.viewport.SetContent(rendered)
 	m.viewport.GotoBottom()
 
 	return nil
+}
+
+func (m *markdownModel) resizeViewport() {
+	contentHeight := m.contentLineCount()
+
+	height := m.windowHeight
+	if height == 0 {
+		height = m.viewport.Height
+	}
+
+	if contentHeight > 0 && (height == 0 || contentHeight < height) {
+		height = contentHeight
+	}
+
+	if height < 1 {
+		height = 1
+	}
+
+	m.viewport.Height = height
+}
+
+func (m *markdownModel) contentLineCount() int {
+	if m.rendered == "" {
+		return 0
+	}
+	return strings.Count(m.rendered, "\n")
 }
