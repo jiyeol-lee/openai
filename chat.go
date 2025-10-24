@@ -168,7 +168,7 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 	ctx context.Context,
 	req ChatCompletionRequest,
 	w io.Writer,
-	opts markdown.StreamOptions,
+	opts StreamOptions,
 ) error {
 	stream, err := c.CreateChatCompletionStream(ctx, req)
 	if err != nil {

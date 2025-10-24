@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/jiyeol-lee/openai"
-	markdown "github.com/jiyeol-lee/openai/internal"
 )
 
 func main() {
@@ -33,7 +32,7 @@ func main() {
 		Temperature: 0.8,
 	}
 
-	opts := markdown.StreamOptions{
+	opts := openai.StreamOptions{
 		WordWrap: 100,
 		Cancel: func() {
 			log.Println("stream cancelled")
