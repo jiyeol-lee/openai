@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"time"
@@ -17,7 +18,7 @@ func main() {
 
 	client := openai.NewClient(apiKey)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	req := openai.ChatCompletionRequest{
@@ -40,6 +41,14 @@ func main() {
 	}
 
 	if err := client.CreateChatCompletionStreamWithMarkdown(ctx, req, os.Stdout, opts); err != nil {
+		if errors.Is(err, context.Canceled) {
+			log.Println("stream interrupted by user")
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Println("stream timed out before completion")
+			return
+		}
 		log.Fatalf("stream error: %v", err)
 	}
 }

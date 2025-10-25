@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/jiyeol-lee/openai/internal"
 )
@@ -170,64 +171,83 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 	w io.Writer,
 	opts StreamOptions,
 ) error {
-	stream, err := c.CreateChatCompletionStream(ctx, req)
-	if err != nil {
-		return fmt.Errorf("failed to create stream: %w", err)
-	}
-	defer stream.Close()
-
-	// Create a channel to pass chunks to the markdown renderer
-	chunks := make(chan markdown.Chunk)
-
 	// Context for controlling the reader goroutine
 	readerCtx, cancelReader := context.WithCancel(ctx)
 	defer cancelReader()
 
-	// Goroutine to read from stream and send to chunks channel
-	errChan := make(chan error, 1)
+	stream, err := c.CreateChatCompletionStream(readerCtx, req)
+	if err != nil {
+		return fmt.Errorf("failed to create stream: %w", err)
+	}
+	var closeStream sync.Once
+	closeStreamFunc := func() {
+		closeStream.Do(func() {
+			_ = stream.Close()
+		})
+	}
+	defer closeStreamFunc()
+
+	// Ensure UI interrupts also stop the reader and underlying stream
+	userCancel := opts.Cancel
+	opts.Cancel = func() {
+		cancelReader()
+		closeStreamFunc()
+		if userCancel != nil {
+			userCancel()
+		}
+	}
+
+	chunkBuf := make(chan markdown.Chunk)
+	streamErr := make(chan error, 1)
 	go func() {
-		defer close(chunks)
+		defer close(chunkBuf)
+		var err error
+		defer func() {
+			streamErr <- err
+		}()
 		for {
+			chunk, recvErr := stream.Recv()
+			if recvErr == io.EOF {
+				return
+			}
+			if recvErr != nil {
+				err = fmt.Errorf("stream error: %w", recvErr)
+				return
+			}
+
+			if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.Content == "" {
+				continue
+			}
+
 			select {
+			case chunkBuf <- markdown.Chunk{Text: chunk.Choices[0].Delta.Content}:
 			case <-readerCtx.Done():
-				errChan <- readerCtx.Err()
+				err = readerCtx.Err()
 				return
-			default:
-			}
-
-			chunk, err := stream.Recv()
-			if err == io.EOF {
-				errChan <- nil
-				return
-			}
-			if err != nil {
-				errChan <- fmt.Errorf("stream error: %w", err)
-				return
-			}
-
-			// Extract content from delta
-			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-				select {
-				case chunks <- markdown.Chunk{Text: chunk.Choices[0].Delta.Content}:
-				case <-readerCtx.Done():
-					errChan <- readerCtx.Err()
-					return
-				}
 			}
 		}
 	}()
 
-	// Render the markdown stream
-	if err := markdown.StreamMarkdown(ctx, chunks, w, opts); err != nil {
-		cancelReader()
-		// Wait for goroutine to finish and check for stream errors
-		if streamErr := <-errChan; streamErr != nil && err == context.Canceled {
-			// If markdown was cancelled, prefer the stream error if available
-			return streamErr
+	next := func(nextCtx context.Context) (markdown.Chunk, error) {
+		select {
+		case <-nextCtx.Done():
+			return markdown.Chunk{}, nextCtx.Err()
+		case chunk, ok := <-chunkBuf:
+			if !ok {
+				err := <-streamErr
+				if err == nil {
+					return markdown.Chunk{}, io.EOF
+				}
+				return markdown.Chunk{}, err
+			}
+			return chunk, nil
 		}
+	}
+
+	// Render the markdown stream
+	if err := markdown.StreamMarkdown(ctx, next, w, opts); err != nil {
 		return err
 	}
 
-	// Wait for the reader goroutine to finish
-	return <-errChan
+	return nil
 }

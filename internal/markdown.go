@@ -23,54 +23,54 @@ type Chunk struct {
 
 func StreamMarkdown(
 	ctx context.Context,
-	chunks <-chan Chunk,
+	next func(context.Context) (Chunk, error),
 	w io.Writer,
 	opts StreamOptions,
 ) error {
-	if opts.Raw {
-		return streamRaw(ctx, chunks, w)
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
+	chunkCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	if opts.Raw {
+		return streamRaw(chunkCtx, next, w)
+	}
 
 	rend, err := newTermRenderer(opts)
 	if err != nil {
 		return err
 	}
 
-	return streamWithViewport(ctx, chunks, w, rend, cancel, opts.Cancel)
+	return streamWithViewport(ctx, chunkCtx, next, w, rend, cancel, opts.Cancel)
 }
 
-func streamRaw(ctx context.Context, chunks <-chan Chunk, w io.Writer) error {
+func streamRaw(ctx context.Context, next func(context.Context) (Chunk, error), w io.Writer) error {
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case chunk, ok := <-chunks:
-			if !ok {
-				return nil
-			}
-			if chunk.Text == "" {
-				continue
-			}
-			if _, err := io.WriteString(w, chunk.Text); err != nil {
-				return err
-			}
+		chunk, err := next(ctx)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if chunk.Text == "" {
+			continue
+		}
+		if _, err := io.WriteString(w, chunk.Text); err != nil {
+			return err
 		}
 	}
 }
 
 func streamWithViewport(
 	ctx context.Context,
-	chunks <-chan Chunk,
+	chunkCtx context.Context,
+	next func(context.Context) (Chunk, error),
 	w io.Writer,
 	rend *glamour.TermRenderer,
 	cancel func(),
 	onInterrupt func(),
 ) error {
 	model := newMarkdownModel(rend, func() tea.Cmd {
-		return waitForChunk(ctx, chunks)
+		return waitForChunk(chunkCtx, next)
 	}, cancel, onInterrupt)
 
 	prog := tea.NewProgram(
@@ -103,17 +103,19 @@ type doneMsg struct {
 	err error
 }
 
-func waitForChunk(ctx context.Context, chunks <-chan Chunk) tea.Cmd {
+func waitForChunk(
+	ctx context.Context,
+	next func(context.Context) (Chunk, error),
+) tea.Cmd {
 	return func() tea.Msg {
-		select {
-		case <-ctx.Done():
-			return doneMsg{err: ctx.Err()}
-		case chunk, ok := <-chunks:
-			if !ok {
-				return doneMsg{}
-			}
-			return chunkMsg(chunk.Text)
+		chunk, err := next(ctx)
+		if err == io.EOF {
+			return doneMsg{}
 		}
+		if err != nil {
+			return doneMsg{err: err}
+		}
+		return chunkMsg(chunk.Text)
 	}
 }
 
