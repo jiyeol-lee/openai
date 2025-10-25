@@ -68,24 +68,18 @@ type loader struct {
 	shouldStop     bool
 	minVisible     time.Duration
 	cyclingChars   []loaderChar
-	labelChars     []loaderChar
-	label          []rune
 	ellipsisFrames []string
 	ellipsisIdx    int
+	lastWidth      int
 }
 
 func newLoader() *loader {
-	label := []rune(" Preparing response")
 	makeDelay := func(max int32, scale time.Duration) time.Duration {
 		return time.Duration(rand.Int31n(max)) * scale //nolint:gosec
 	}
 
 	makeInitialDelay := func() time.Duration {
 		return makeDelay(3, 40*time.Millisecond)
-	}
-
-	makeLifetime := func() time.Duration {
-		return makeDelay(5, 160*time.Millisecond) + 120*time.Millisecond
 	}
 
 	cycling := make([]loaderChar, loaderCharCyclingCount)
@@ -96,15 +90,6 @@ func newLoader() *loader {
 		}
 	}
 
-	labelChars := make([]loaderChar, len(label))
-	for i, r := range label {
-		labelChars[i] = loaderChar{
-			finalValue:   r,
-			initialDelay: makeInitialDelay(),
-			lifetime:     makeLifetime(),
-		}
-	}
-
 	now := time.Now()
 	l := &loader{
 		start:          now.Add(-loaderInitialBoost),
@@ -112,8 +97,6 @@ func newLoader() *loader {
 		active:         true,
 		minVisible:     350 * time.Millisecond,
 		cyclingChars:   cycling,
-		labelChars:     labelChars,
-		label:          label,
 		ellipsisFrames: []string{"", ".", "..", "..."},
 	}
 	l.update()
@@ -139,17 +122,6 @@ func (l *loader) update() {
 		}
 	}
 
-	for i := range l.labelChars {
-		switch l.labelChars[i].state(l.start) {
-		case loaderInitial:
-			l.labelChars[i].currentValue = '.'
-		case loaderCycling:
-			l.labelChars[i].randomize()
-		case loaderSettled:
-			l.labelChars[i].currentValue = l.labelChars[i].finalValue
-		}
-	}
-
 	if l.shouldStop && time.Since(l.displayStart) >= l.minVisible {
 		l.active = false
 	}
@@ -163,20 +135,26 @@ func (l *loader) advanceEllipsis() {
 }
 
 func (l *loader) View() string {
-	var b strings.Builder
+	var random strings.Builder
 	for _, c := range l.cyclingChars {
 		if c.currentValue == 0 {
 			continue
 		}
-		b.WriteRune(c.currentValue)
+		random.WriteRune(c.currentValue)
 	}
-	b.WriteRune(' ')
-	for _, c := range l.labelChars {
-		if c.currentValue == 0 {
-			continue
-		}
-		b.WriteRune(c.currentValue)
+
+	randomText := strings.TrimSpace(random.String())
+	if randomText == "" {
+		randomText = strings.Repeat(".", loaderCharCyclingCount/2)
 	}
-	b.WriteString(l.ellipsisFrames[l.ellipsisIdx])
-	return b.String()
+	text := randomText + " " + l.ellipsisFrames[l.ellipsisIdx]
+
+	width := len([]rune(text))
+	if width < l.lastWidth {
+		text += strings.Repeat(" ", l.lastWidth-width)
+	} else {
+		l.lastWidth = width
+	}
+
+	return text
 }
