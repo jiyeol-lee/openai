@@ -175,43 +175,75 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 	readerCtx, cancelReader := context.WithCancel(ctx)
 	defer cancelReader()
 
-	stream, err := c.CreateChatCompletionStream(readerCtx, req)
-	if err != nil {
-		return fmt.Errorf("failed to create stream: %w", err)
+	var (
+		closeMu   sync.Mutex
+		closeFunc = func() {}
+	)
+
+	setCloseFunc := func(fn func()) {
+		closeMu.Lock()
+		closeFunc = fn
+		closeMu.Unlock()
 	}
-	var closeStream sync.Once
-	closeStreamFunc := func() {
-		closeStream.Do(func() {
-			_ = stream.Close()
-		})
+
+	callCloseFunc := func() {
+		closeMu.Lock()
+		fn := closeFunc
+		closeMu.Unlock()
+		fn()
 	}
-	defer closeStreamFunc()
 
 	// Ensure UI interrupts also stop the reader and underlying stream
 	userCancel := opts.Cancel
 	opts.Cancel = func() {
 		cancelReader()
-		closeStreamFunc()
+		callCloseFunc()
 		if userCancel != nil {
 			userCancel()
 		}
 	}
 
 	chunkBuf := make(chan markdown.Chunk)
-	streamErr := make(chan error, 1)
+	streamErrCh := make(chan error, 1)
+	var (
+		streamErrOnce sync.Once
+		streamResult  error
+	)
+	waitStreamErr := func() error {
+		streamErrOnce.Do(func() {
+			streamResult = <-streamErrCh
+		})
+		return streamResult
+	}
+
 	go func() {
 		defer close(chunkBuf)
-		var err error
+		var resultErr error
 		defer func() {
-			streamErr <- err
+			streamErrCh <- resultErr
 		}()
+
+		stream, err := c.CreateChatCompletionStream(readerCtx, req)
+		if err != nil {
+			resultErr = fmt.Errorf("failed to create stream: %w", err)
+			return
+		}
+
+		var closeStream sync.Once
+		setCloseFunc(func() {
+			closeStream.Do(func() {
+				stream.Close()
+			})
+		})
+		defer callCloseFunc()
+
 		for {
 			chunk, recvErr := stream.Recv()
 			if recvErr == io.EOF {
 				return
 			}
 			if recvErr != nil {
-				err = fmt.Errorf("stream error: %w", recvErr)
+				resultErr = fmt.Errorf("stream error: %w", recvErr)
 				return
 			}
 
@@ -222,7 +254,7 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 			select {
 			case chunkBuf <- markdown.Chunk{Text: chunk.Choices[0].Delta.Content}:
 			case <-readerCtx.Done():
-				err = readerCtx.Err()
+				resultErr = readerCtx.Err()
 				return
 			}
 		}
@@ -234,7 +266,7 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 			return markdown.Chunk{}, nextCtx.Err()
 		case chunk, ok := <-chunkBuf:
 			if !ok {
-				err := <-streamErr
+				err := waitStreamErr()
 				if err == nil {
 					return markdown.Chunk{}, io.EOF
 				}
@@ -244,8 +276,11 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 		}
 	}
 
-	// Render the markdown stream
 	if err := markdown.StreamMarkdown(ctx, next, w, opts); err != nil {
+		return err
+	}
+
+	if err := waitStreamErr(); err != nil {
 		return err
 	}
 
