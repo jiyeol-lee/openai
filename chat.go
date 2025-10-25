@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -67,6 +68,43 @@ type StreamReader struct {
 	reader  *bufio.Reader
 	closer  io.Closer
 	isFirst bool
+}
+
+// deferredCloser allows setting and invoking a close function exactly once,
+// even when the close request happens before the function is available.
+type deferredCloser struct {
+	mu     sync.Mutex
+	closed bool
+	fn     func()
+}
+
+// Set registers the close function. If Close was already called the function
+// runs immediately.
+func (d *deferredCloser) Set(fn func()) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		if fn != nil {
+			fn()
+		}
+		return
+	}
+	d.fn = fn
+}
+
+// Close executes the registered function exactly once.
+func (d *deferredCloser) Close() {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	d.closed = true
+	fn := d.fn
+	d.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // Recv reads the next chunk from the stream
@@ -171,71 +209,78 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 	w io.Writer,
 	opts StreamOptions,
 ) error {
-	// Context for controlling the reader goroutine
 	readerCtx, cancelReader := context.WithCancel(ctx)
 	defer cancelReader()
 
-	var (
-		closeMu   sync.Mutex
-		closeFunc = func() {}
-	)
+	closer := &deferredCloser{}
+	pump := c.startChunkPump(readerCtx, req, closer)
 
-	setCloseFunc := func(fn func()) {
-		closeMu.Lock()
-		closeFunc = fn
-		closeMu.Unlock()
-	}
-
-	callCloseFunc := func() {
-		closeMu.Lock()
-		fn := closeFunc
-		closeMu.Unlock()
-		fn()
-	}
-
-	// Ensure UI interrupts also stop the reader and underlying stream
 	userCancel := opts.Cancel
 	opts.Cancel = func() {
 		cancelReader()
-		callCloseFunc()
+		closer.Close()
 		if userCancel != nil {
 			userCancel()
 		}
 	}
 
-	chunkBuf := make(chan markdown.Chunk)
-	streamErrCh := make(chan error, 1)
-	var (
-		streamErrOnce sync.Once
-		streamResult  error
-	)
-	waitStreamErr := func() error {
-		streamErrOnce.Do(func() {
-			streamResult = <-streamErrCh
-		})
-		return streamResult
+	next := func(nextCtx context.Context) (markdown.Chunk, error) {
+		select {
+		case <-nextCtx.Done():
+			return markdown.Chunk{}, nextCtx.Err()
+		case chunk, ok := <-pump.chunks:
+			if !ok {
+				return markdown.Chunk{}, io.EOF
+			}
+			return chunk, nil
+		}
 	}
 
-	go func() {
-		defer close(chunkBuf)
-		var resultErr error
-		defer func() {
-			streamErrCh <- resultErr
-		}()
+	uiErr := markdown.StreamMarkdown(ctx, next, w, opts)
+	pumpErr := <-pump.done
 
-		stream, err := c.CreateChatCompletionStream(readerCtx, req)
+	if uiErr != nil {
+		if errors.Is(uiErr, context.Canceled) && pumpErr != nil {
+			return pumpErr
+		}
+		return uiErr
+	}
+
+	return pumpErr
+}
+
+// chunkPump holds the channels used to pass chunks to the markdown renderer
+// and to report completion/error back to the caller.
+type chunkPump struct {
+	chunks <-chan markdown.Chunk
+	done   <-chan error
+}
+
+// startChunkPump spins up a goroutine that reads SSE events from OpenAI and
+// forwards only the streamed text into a channel suitable for the markdown
+// renderer. It ensures the underlying stream is closed exactly once and that
+// errors are propagated through the done channel.
+func (c *Client) startChunkPump(
+	ctx context.Context,
+	req ChatCompletionRequest,
+	closer *deferredCloser,
+) *chunkPump {
+	chunkCh := make(chan markdown.Chunk)
+	doneCh := make(chan error, 1)
+
+	go func() {
+		defer close(chunkCh)
+		var finalErr error
+		defer func() { doneCh <- finalErr }()
+
+		stream, err := c.CreateChatCompletionStream(ctx, req)
 		if err != nil {
-			resultErr = fmt.Errorf("failed to create stream: %w", err)
+			finalErr = fmt.Errorf("failed to create stream: %w", err)
 			return
 		}
 
-		var closeStream sync.Once
-		setCloseFunc(func() {
-			closeStream.Do(func() {
-				stream.Close()
-			})
-		})
-		defer callCloseFunc()
+		closer.Set(func() { stream.Close() })
+		defer closer.Close()
 
 		for {
 			chunk, recvErr := stream.Recv()
@@ -243,46 +288,33 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 				return
 			}
 			if recvErr != nil {
-				resultErr = fmt.Errorf("stream error: %w", recvErr)
+				finalErr = fmt.Errorf("stream error: %w", recvErr)
 				return
 			}
 
-			if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.Content == "" {
+			text := extractDeltaText(chunk)
+			if text == "" {
 				continue
 			}
 
 			select {
-			case chunkBuf <- markdown.Chunk{Text: chunk.Choices[0].Delta.Content}:
-			case <-readerCtx.Done():
-				resultErr = readerCtx.Err()
+			case chunkCh <- markdown.Chunk{Text: text}:
+			case <-ctx.Done():
+				finalErr = ctx.Err()
 				return
 			}
 		}
 	}()
 
-	next := func(nextCtx context.Context) (markdown.Chunk, error) {
-		select {
-		case <-nextCtx.Done():
-			return markdown.Chunk{}, nextCtx.Err()
-		case chunk, ok := <-chunkBuf:
-			if !ok {
-				err := waitStreamErr()
-				if err == nil {
-					return markdown.Chunk{}, io.EOF
-				}
-				return markdown.Chunk{}, err
-			}
-			return chunk, nil
-		}
+	return &chunkPump{
+		chunks: chunkCh,
+		done:   doneCh,
 	}
+}
 
-	if err := markdown.StreamMarkdown(ctx, next, w, opts); err != nil {
-		return err
+func extractDeltaText(resp ChatCompletionStreamResponse) string {
+	if len(resp.Choices) == 0 {
+		return ""
 	}
-
-	if err := waitStreamErr(); err != nil {
-		return err
-	}
-
-	return nil
+	return resp.Choices[0].Delta.Content
 }
