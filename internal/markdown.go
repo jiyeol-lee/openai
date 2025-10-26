@@ -2,6 +2,7 @@ package markdown
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ type StreamOptions struct {
 	Raw      bool
 	WordWrap int
 	Cancel   func()
+	UIWriter io.Writer
 }
 
 // Chunk represents an incremental markdown fragment emitted by the stream.
@@ -45,7 +47,7 @@ func StreamMarkdown(
 		return err
 	}
 
-	return streamWithViewport(ctx, chunkCtx, next, w, rend, cancel, opts.Cancel)
+	return streamWithViewport(ctx, chunkCtx, next, w, rend, cancel, opts.Cancel, opts)
 }
 
 // streamRaw simply writes chunks as they arrive without any terminal UI.
@@ -76,22 +78,43 @@ func streamWithViewport(
 	rend *glamour.TermRenderer,
 	cancel func(),
 	onInterrupt func(),
+	opts StreamOptions,
 ) error {
 	model := newMarkdownModel(rend, func() tea.Cmd {
 		return waitForChunk(chunkCtx, next)
 	}, cancel, onInterrupt)
 
+	uiWriter := opts.UIWriter
+	if uiWriter == nil {
+		uiWriter = w
+	}
+
 	prog := tea.NewProgram(
 		model,
 		tea.WithContext(ctx),
-		tea.WithOutput(w),
+		tea.WithOutput(uiWriter),
 	)
 
 	if _, err := prog.Run(); err != nil {
 		return err
 	}
 
-	return model.err
+	if model.err != nil {
+		return model.err
+	}
+
+	clearViewport(uiWriter, model.lastView)
+
+	if rendered := model.rendered; rendered != "" {
+		if !strings.HasSuffix(rendered, "\n") {
+			rendered += "\n"
+		}
+		if _, err := fmt.Fprintf(w, "%s", rendered); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // newTermRenderer builds a Glamour renderer honoring the supplied options.
@@ -147,6 +170,7 @@ type markdownModel struct {
 	onInterrupt  func()
 	err          error
 	loader       *loader
+	lastView     string
 }
 
 // newMarkdownModel constructs the Bubble Tea model that manages the loader and
@@ -236,9 +260,11 @@ func (m *markdownModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View renders either the loader animation or the markdown viewport.
 func (m *markdownModel) View() string {
 	if m.loader.active {
-		return m.loader.View()
+		m.lastView = m.loader.View()
+		return m.lastView
 	}
-	return m.viewport.View()
+	m.lastView = m.viewport.View()
+	return m.lastView
 }
 
 // next requests the next chunk if the producer command is set.
@@ -322,4 +348,27 @@ func (m *markdownModel) ellipsisTickCmd() tea.Cmd {
 	return tea.Tick(loaderEllipsisInterval, func(time.Time) tea.Msg {
 		return ellipsisTickMsg{}
 	})
+}
+
+// clearViewport erases the last viewport rendering from the UI writer so the
+// final Glamour output can stand alone once streaming completes.
+func clearViewport(w io.Writer, view string) {
+	if w == nil || view == "" {
+		return
+	}
+
+	lines := strings.Count(view, "\n")
+	if !strings.HasSuffix(view, "\n") {
+		lines++
+	}
+	if lines < 1 {
+		lines = 1
+	}
+
+	for i := 0; i < lines; i++ {
+		_, _ = fmt.Fprint(w, "\r\033[2K")
+		if i+1 < lines {
+			_, _ = fmt.Fprint(w, "\033[1A")
+		}
+	}
 }

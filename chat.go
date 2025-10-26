@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 
@@ -233,6 +234,12 @@ func (c *Client) CreateChatCompletionStreamWithMarkdown(
 				return markdown.Chunk{}, io.EOF
 			}
 			return chunk, nil
+		}
+	}
+
+	if opts.UIWriter == nil {
+		if file, ok := w.(*os.File); ok && file == os.Stdout {
+			opts.UIWriter = os.Stderr
 		}
 	}
 
