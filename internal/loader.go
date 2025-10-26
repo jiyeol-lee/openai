@@ -43,6 +43,8 @@ type loaderChar struct {
 	lifetime     time.Duration
 }
 
+// state reports whether the character is still warming up, actively cycling, or
+// already settled on its final rune for the current animation frame.
 func (c loaderChar) state(start time.Time) loaderState {
 	now := time.Now()
 	if now.Before(start.Add(c.initialDelay)) {
@@ -54,6 +56,8 @@ func (c loaderChar) state(start time.Time) loaderState {
 	return loaderCycling
 }
 
+// randomize picks a new random rune for the character to display during the
+// cycling state, using the shared RNG guarded by a mutex.
 func (c *loaderChar) randomize() {
 	loaderRandMu.Lock()
 	idx := loaderRand.Intn(len(loaderRunes))
@@ -73,6 +77,9 @@ type loader struct {
 	lastWidth      int
 }
 
+// newLoader constructs a loader with randomized character delays, primes the
+// animation so the label appears immediately, and returns the initialized
+// instance ready for rendering.
 func newLoader() *loader {
 	makeDelay := func(max int32, scale time.Duration) time.Duration {
 		return time.Duration(rand.Int31n(max)) * scale //nolint:gosec
@@ -103,10 +110,15 @@ func newLoader() *loader {
 	return l
 }
 
+// requestStop signals that the loader should wind down; it stays visible until
+// the minimum on-screen duration elapses so the UI does not flicker.
 func (l *loader) requestStop() {
 	l.shouldStop = true
 }
 
+// update advances every animated character according to its timing state and
+// deactivates the loader once it has been visible long enough after a stop
+// request.
 func (l *loader) update() {
 	if !l.active {
 		return
@@ -127,6 +139,8 @@ func (l *loader) update() {
 	}
 }
 
+// advanceEllipsis rotates through the precomputed ellipsis frames, giving the
+// loader label a subtle trailing animation while it remains active.
 func (l *loader) advanceEllipsis() {
 	if !l.active {
 		return
@@ -134,6 +148,9 @@ func (l *loader) advanceEllipsis() {
 	l.ellipsisIdx = (l.ellipsisIdx + 1) % len(l.ellipsisFrames)
 }
 
+// View renders the loader into a single string by concatenating the randomised
+// glyphs and the current ellipsis frame, padding with spaces when the width
+// shrinks so the terminal output remains stable.
 func (l *loader) View() string {
 	var random strings.Builder
 	for _, c := range l.cyclingChars {
