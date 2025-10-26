@@ -22,7 +22,7 @@ func main() {
 	defer cancel()
 
 	req := openai.ChatCompletionRequest{
-		Model: "gpt-4o-mini",
+		Model: "gpt-5-nano",
 		Messages: []openai.Message{
 			{Role: "system", Content: "You are a go programming assistant."},
 			{
@@ -30,7 +30,8 @@ func main() {
 				Content: "Explain the goroutines in Go programming language with examples in markdown format.",
 			},
 		},
-		Temperature: 0.8,
+		Temperature:     1,
+		ReasoningEffort: "low",
 	}
 
 	opts := openai.StreamOptions{
